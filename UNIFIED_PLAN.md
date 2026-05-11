@@ -1,18 +1,30 @@
-# Polymarket Prediction Bot — Unified Build Plan
+# Stock & Crypto Price Prediction Bot — Unified Build Plan
 
-> Authored by: planner (Phase 1)
+> Authored by: planner (Phase 1, revised)
 > Date: 2026-05-11
 > Branch: unified-build
+> Supersedes: initial Polymarket-scoped plan (commit: "planner: unified build plan")
 
 ---
 
 ## 0. Context and Scope
 
-This plan governs Phase 2 implementation only: building the **prediction bot** (`p_0` emitter) and its data ingestion layer from scratch, in this empty repository. The copy-trading bot described in the handoff docs lives in a separate repo (`polymarked_copy_trading_bot`) and is **out of scope** here.
+**New scope**: This bot predicts **directional price movements on stocks and crypto assets** over a fixed forward horizon. Polymarket is dropped entirely as a prediction target. The handoff docs in `md_files/` remain useful as historical context (especially the Bayesian aggregation framing, Kelly sizing rationale, and the regression-baseline-first principle), but any Polymarket-specific design (Gamma API, CLOB, funder/signer, `p_0 vs market price`) is superseded by this document.
 
-The three research PDFs in `Res/` (Bayesian regression in finance, adversarial synthesis on market data, hidden Markov model for market regimes) inform the model architecture. They are not required reading before Phase 2 starts but should be consulted when implementer-model chooses the model family.
+**Prediction target**: binary direction classification — will the asset close higher than today's close in N trading days? Rationale: direction is a clean, well-defined label; a calibrated probability of UP gives a natural Kelly-sizing input; it avoids the additional complexity of return magnitude estimation while still producing an actionable signal. The horizon N is a tunable config value; the MVP default is **5 trading days**.
 
-The `py_construction/pred_bot.ipynb` notebook is empty and can be used as a scratch pad — it is not part of the production deliverable.
+**Data sources (resolved)**:
+- Stocks: `yfinance` (free, key-less, covers US equities + indices). Recommendation to team lead: confirm this is acceptable. It is Yahoo Finance data, which is suitable for MVP/research but has ToS restrictions on commercial redistribution — flag before any production deployment.
+- Crypto: **CoinGecko public REST API** (free tier, no key required for basic OHLCV on major pairs, 30 req/min rate limit). Rationale for choosing CoinGecko over Binance: no account or API key needed for MVP; covers a wide set of coins; rate limits are manageable for a small universe. Binance public REST is an easy upgrade path if higher resolution or lower latency is needed later.
+
+**What this build does NOT include**:
+- Execution, order placement, wallet management
+- Copy-trading signal ingestion
+- Polymarket, Gamma API, FinFeedAPI, Bitquery
+- LLM-in-the-loop features
+- The Bayesian posterior combination with a copy-trading signal (`p_posterior ∝ w_0*p_0 + w_c*p_c`) — that integration point is deferred until the copy bot is stable
+
+The `py_construction/pred_bot.ipynb` notebook is empty and can be used for experimentation; it is not a production deliverable.
 
 ---
 
@@ -21,59 +33,35 @@ The `py_construction/pred_bot.ipynb` notebook is empty and can be used as a scra
 ### `src/data/` — Data Layer (owned by implementer-data)
 
 Responsible for:
-- Fetching and caching market metadata (Gamma API)
-- Fetching cross-venue OHLCV price data (FinFeedAPI)
-- Fetching on-chain resolved-market history (Bitquery GraphQL)
-- Normalizing all external data into canonical internal schemas (Pydantic models)
-- Persisting raw and processed data to disk (cache layer)
-- Providing a clean, side-effect-free interface to `src/model/`
+- Fetching OHLCV price history for a configured universe of stock tickers via `yfinance`
+- Fetching OHLCV price history for a configured universe of crypto pairs via CoinGecko REST
+- Normalizing both sources into a canonical time-aligned panel of `AssetOHLCV` records
+- Persisting raw and processed data to disk (cache layer with TTL)
+- Providing a clean, side-effect-free interface: given a list of symbols and a date range, return a normalized panel ready for feature engineering
 
 Does NOT:
-- Run models or produce probabilities
-- Place orders
-- Access wallet/signing infrastructure
+- Define or compute features (that is `src/model/features.py`)
+- Run models or produce predictions
+- Access any wallet, signing, or execution infrastructure
 
 ### `src/model/` — Model Layer (owned by implementer-model)
 
 Responsible for:
-- Loading features produced by `src/data/`
-- Training and persisting a regression baseline model
-- Producing `p_0` (probability) + confidence/variance per market
-- Evaluating model quality (Brier score, log-loss) over resolved markets
-- Exposing a clean prediction API consumed by future integration code
+- Engineering time-series features from the normalized OHLCV panel (returns, momentum, volatility, moving-average crossovers)
+- Constructing train/validation/test splits respecting temporal order (no lookahead)
+- Training a logistic regression baseline (scikit-learn) predicting 5-day direction
+- Persisting model artifacts (joblib + metadata)
+- Producing `PredictionResult` (probability of UP, confidence interval) for a given symbol + feature vector
+- Evaluating model quality: accuracy, AUC-ROC, Brier score, calibration curve
 
 Does NOT:
-- Fetch external data directly (all data comes from `src/data/`)
-- Manage secrets or API keys
-- Implement execution or order logic
+- Fetch or cache data (all data comes from `src/data/`)
+- Manage secrets or API credentials
+- Implement any execution logic
 
-### Shared Interface (contract between the two modules)
+### `src/shared/` — Shared Contract (owned by implementer-data, written first)
 
-The single handoff point is a Pydantic schema defined in `src/shared/schemas.py`:
-
-```python
-class MarketFeatures(BaseModel):
-    market_id: str
-    question: str
-    category: str
-    end_date: datetime
-    current_price_yes: float          # from Gamma API
-    cross_venue_prices: dict[str, float]  # venue -> price, from FinFeedAPI
-    volume_24h: float
-    liquidity: float
-    days_to_resolution: float
-    resolved: bool
-    outcome: Optional[int]            # 1=YES, 0=NO, None if unresolved
-
-class PredictionResult(BaseModel):
-    market_id: str
-    p_0: float                        # model probability for YES
-    variance: float                   # model uncertainty
-    timestamp: datetime
-    model_version: str
-```
-
-`src/data/` produces `MarketFeatures`. `src/model/` consumes `MarketFeatures` and emits `PredictionResult`. Neither module imports from the other.
+Single file: `src/shared/schemas.py`. Defines the Pydantic models that form the handoff between the two modules. Neither module imports from the other — only from `src/shared/`.
 
 ---
 
@@ -85,29 +73,26 @@ class PredictionResult(BaseModel):
 src/
   data/
     __init__.py
-    gamma_client.py          # Gamma API market metadata fetcher
-    finfeed_client.py        # FinFeedAPI cross-venue OHLCV fetcher
-    bitquery_client.py       # Bitquery GraphQL resolved-market history
-    cache.py                 # disk-based caching (JSON/SQLite)
-    normalizer.py            # raw API responses → MarketFeatures
-    pipeline.py              # orchestrates fetch + normalize + cache
+    yfinance_client.py       # fetch stock OHLCV via yfinance
+    coingecko_client.py      # fetch crypto OHLCV via CoinGecko public REST (httpx)
+    cache.py                 # disk-based cache (JSON/Parquet), TTL-aware
+    normalizer.py            # raw source data -> AssetOHLCV, time-aligned panel
+    pipeline.py              # orchestrates: fetch -> normalize -> cache -> return panel
   shared/
     __init__.py
-    schemas.py               # MarketFeatures + PredictionResult Pydantic models
+    schemas.py               # AssetOHLCV + PredictionResult Pydantic models (see §1)
 
 tests/
   data/
     __init__.py
-    test_gamma_client.py
-    test_finfeed_client.py
-    test_bitquery_client.py
+    test_yfinance_client.py
+    test_coingecko_client.py
     test_normalizer.py
     test_pipeline.py
-    conftest.py              # shared fixtures for data tests
+    conftest.py
     fixtures/
-      gamma_market_sample.json
-      finfeed_ohlcv_sample.json
-      bitquery_resolved_sample.json
+      yfinance_aapl_sample.json    # 90+ days of AAPL OHLCV
+      coingecko_btc_sample.json    # 90+ days of BTC/USD OHLCV
 ```
 
 ### implementer-model owns exclusively:
@@ -116,180 +101,237 @@ tests/
 src/
   model/
     __init__.py
-    features.py              # feature engineering from MarketFeatures
-    trainer.py               # train + persist regression baseline
-    predictor.py             # load model, produce PredictionResult
-    evaluator.py             # Brier score, log-loss on resolved markets
-    model_store.py           # versioned model artifact save/load
+    features.py              # time-series feature engineering from AssetOHLCV panel
+    splitter.py              # temporal train/val/test split, no lookahead
+    trainer.py               # fit logistic regression, persist artifact
+    predictor.py             # load artifact, produce PredictionResult
+    evaluator.py             # accuracy, AUC-ROC, Brier, calibration
+    model_store.py           # versioned joblib save/load with metadata JSON
+
+models/                      # gitignored artifact directory (created at runtime)
 
 tests/
   model/
     __init__.py
     test_features.py
+    test_splitter.py
     test_trainer.py
     test_predictor.py
     test_evaluator.py
     conftest.py
     fixtures/
-      sample_features.json
-      sample_resolved_markets.json
+      sample_ohlcv_panel.json      # synthetic 90-day panel for fast tests
+      sample_predictions.json
 ```
 
-### Neither implementer creates:
+### Neither implementer creates (planner sets up before Phase 2 starts):
 
 ```
-config/
-  .env.example               # created by planner in UNIFIED_PLAN.md (this doc)
-  settings.py                # created by planner for Phase 2 kickoff
-pyproject.toml               # project-wide, created once before Phase 2 starts
+pyproject.toml
+.env.example
+.gitignore                   # includes models/, .env, __pycache__, *.pyc
+src/__init__.py
+tests/__init__.py
 ```
 
-Note: `src/shared/schemas.py` is created by implementer-data as the first task (task D-1 below), since the model implementer blocks on it. implementer-model must not modify it unilaterally — any schema change requires both implementers to agree.
+**Ownership rule for `src/shared/schemas.py`**: implementer-data creates and owns this file. Any change to the schema after both implementers have started requires agreement from both parties — raise a question to the planner or team lead before modifying.
 
 ---
 
-## 3. Test Strategy
+## 3. Shared Interface (Pydantic schemas in `src/shared/schemas.py`)
+
+```python
+from pydantic import BaseModel
+from datetime import date
+from typing import Optional
+
+class AssetOHLCV(BaseModel):
+    symbol: str               # e.g. "AAPL" or "BTC-USD"
+    asset_type: str           # "stock" | "crypto"
+    date: date
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    source: str               # "yfinance" | "coingecko"
+
+class PredictionResult(BaseModel):
+    symbol: str
+    prediction_date: date     # date the prediction is made
+    horizon_days: int         # e.g. 5
+    p_up: float               # probability asset closes higher in horizon_days
+    confidence: float         # model confidence (e.g. max class probability)
+    model_version: str
+```
+
+`src/data/` produces lists of `AssetOHLCV`. `src/model/` consumes them and emits `PredictionResult`.
+
+---
+
+## 4. Test Strategy
 
 ### Framework
 
 - **pytest** with `pytest-cov` for coverage
-- **pytest-mock** (`mocker` fixture) for patching external API calls
-- Test files live under `tests/data/` and `tests/model/` mirroring the source tree
+- **pytest-mock** (`mocker` fixture) for patching
+- `respx` for mocking `httpx` async HTTP calls (CoinGecko client)
+- `unittest.mock.patch` for patching `yfinance.download` (yfinance wraps its own HTTP internally)
+- All tests are fully offline — no live network calls
 
-### Mocking strategy for external APIs
+### Mocking strategy
 
-All external network calls (Gamma API, FinFeedAPI, Bitquery) are mocked at the HTTP level using `responses` (for `requests`-based clients) or `pytest-httpx` (for `httpx`-based clients). JSON fixtures under `tests/data/fixtures/` provide realistic but static response data. No test should make a live network call.
+| Client | Mock approach |
+|---|---|
+| `yfinance_client.py` | Patch `yfinance.download` to return a pre-built DataFrame from fixture |
+| `coingecko_client.py` | Use `respx` to intercept `httpx` calls and return fixture JSON |
+| `cache.py` | Point at `tmp_path` pytest fixture; no mocking needed |
 
-The `cache.py` module provides a `DiskCache` that can be pointed at a temp directory in tests (`tmp_path` fixture from pytest).
+Fixtures live under `tests/data/fixtures/` and `tests/model/fixtures/`. They must cover at least 90 calendar days so temporal split tests have enough data.
 
 ### Coverage targets
 
-- `src/data/`: 85% line coverage minimum
-- `src/model/`: 80% line coverage minimum
-- `src/shared/schemas.py`: 100% (Pydantic validation paths)
+- `src/data/`: **85%** line coverage minimum
+- `src/model/`: **80%** line coverage minimum
+- `src/shared/schemas.py`: **100%** (all Pydantic field validation paths exercised)
 
-### Test naming convention
+### Temporal integrity requirement
 
-`test_<module>_<behavior>` — e.g. `test_normalizer_handles_missing_cross_venue_price`.
+Every test that exercises `splitter.py` or `trainer.py` must assert that no test-set date appears in the training window. This is the most critical correctness property of the model layer.
 
 ### Integration smoke test
 
-One lightweight integration test file `tests/test_pipeline_smoke.py` (owned by neither implementer; written after both modules are done) that loads fixture data through the full `pipeline.py → predictor.py` path without any mocks, confirming the two modules compose correctly.
+`tests/test_smoke.py` (written after both modules complete, owned by neither): loads fixture OHLCV data through `pipeline.py → features.py → trainer.py → predictor.py` end-to-end without mocks, confirming the two modules compose correctly on a small synthetic dataset.
 
 ---
 
-## 4. Risk and Assumption Notes
+## 5. Risk and Assumption Notes
 
-### API access
+### Rate limits on free APIs
 
-- **Gamma API**: free, no key required for public markets. Assumption: rate limits are not a problem for a small market set. Risk: endpoint schema changes; pin the API version if available.
-- **FinFeedAPI**: requires a paid subscription (`FINFEED_API_KEY`). Risk: the key may not yet exist. implementer-data should build `finfeed_client.py` to fail loudly (not silently skip) when the key is absent.
-- **Bitquery**: requires an API key (`BITQUERY_API_KEY`). Risk: GraphQL schema may differ from examples in the handoff docs; implementer-data should validate against live schema before writing tests.
+- **CoinGecko free tier**: ~30 requests/minute. For a small universe (10–20 crypto pairs), this is fine. `coingecko_client.py` must implement a simple backoff/retry on HTTP 429. Risk: free tier may be further restricted without notice.
+- **yfinance**: no official rate limit documented, but Yahoo Finance throttles aggressive scrapers. For MVP (fetching once per day), this is not a concern. Risk: Yahoo Finance has ToS restrictions on commercial use — confirm acceptability before any production deployment.
 
-### Secrets management
+### Lookahead bias in time-series features
 
-- All keys in `.env` (git-ignored). `.env.example` documents required vars with no values.
-- Required vars: `FINFEED_API_KEY`, `BITQUERY_API_KEY`, `GAMMA_BASE_URL` (defaultable).
-- Do not hardcode any key anywhere in source. `src/data/` reads keys from environment only.
+The single highest risk in any price-prediction model. Mitigations:
+- All features must be computed using only data available at or before `prediction_date`.
+- `splitter.py` enforces a strict temporal cutoff: train on rows up to date T, validate on T+1..T+k, test on T+k+1..end. No shuffling across the full dataset.
+- The `features.py` implementation must use only `shift(1)` or greater lags when computing rolling statistics — never `shift(0)` on the target's own row.
+- A test in `test_features.py` must explicitly assert that features at date D do not incorporate close price at date D (the label).
 
-### Model training data availability
+### Regime shift between train and test windows
 
-- Historical resolved-market data comes from Bitquery. Risk: limited history depth on free tier; implementer-model should document minimum required history (recommend: 90 days of resolved markets).
-- The regression baseline does not require a GPU. Risk: if the dataset is too small (<200 resolved markets), Brier score estimates will be noisy; note this in the evaluator output.
+A model trained on 90 days may capture a single market regime. Mitigations in the MVP:
+- Record the train/test date ranges in the model metadata JSON (persisted by `model_store.py`).
+- `evaluator.py` reports performance per calendar quarter so regime drift is visible.
+- Accept that the MVP baseline may underperform out-of-sample — the goal is a reproducible benchmark, not immediate alpha.
 
-### Architecture conflict resolution
+### yfinance ToS for production
 
-The handoff docs describe a Phase 7 service split (copy bot + prediction bot as separate services). That is **future scope**. For this build, the prediction bot is a standalone Python package — no message queue, no service boundary, no integration with the copy bot yet. `PredictionResult` is the output format that will eventually plug into the Bayesian posterior formula (`p_posterior ∝ w_0*p_0 + w_c*p_c`), but the copy-trading side of that equation is not built here.
+yfinance is a scraper of Yahoo Finance data. It is widely used for research but Yahoo's ToS prohibit commercial redistribution. Flag this before any live deployment. Upgrade path: Alpha Vantage, Polygon.io, or Twelve Data (all have free tiers with API keys).
 
-The master context doc (`polymarket_copytrading_master_context.md`) treats Phase 7 as blocked until the copy bot is live-ready. This build plan builds the prediction bot MVP independently, consistent with the handoff_2 doc's recommendation: "start with a regression baseline first." There is no conflict — both docs agree on regression-first; they differ only in phase numbering convention (master context calls it Phase 7; handoff_2 calls it Phase 4). This plan treats it as the current goal.
+### Small universe risk
 
-### Naming conflict
+Starting with a small symbol universe (recommend: 5 stocks + 5 crypto pairs for MVP) means the model has limited cross-sectional data. The baseline should be evaluated per-asset, not only on the pooled dataset, to detect assets where the model has no edge.
 
-handoff_2.md uses `p_0` for the prediction bot probability; tools_handoff_1.md uses `p_own`. This plan standardizes on `p_0` (matches `PredictionResult.p_0` above).
+### No existing code to migrate
 
-### No existing code to preserve
-
-The notebook `py_construction/pred_bot.ipynb` is empty. There is no existing state to migrate. Implementers start from a clean slate.
+`py_construction/pred_bot.ipynb` is empty. Implementers start from a clean slate.
 
 ---
 
-## 5. Prioritized Task List
+## 6. Prioritized Task List
 
-Dependencies flow top to bottom. No task should begin until all tasks it depends on are marked complete.
+Dependencies flow top to bottom. A task must not begin until all tasks it lists as dependencies are marked complete.
 
-### Setup (before Phase 2 implementers start)
+### Setup (planner creates before Phase 2 implementers start)
 
-- [SETUP-1] Create `pyproject.toml` with `pytest`, `pytest-cov`, `pytest-mock`, `responses`, `pydantic`, `requests` or `httpx`, `python-dotenv`, `scikit-learn` as dependencies.
-- [SETUP-2] Create `.env.example` documenting `FINFEED_API_KEY`, `BITQUERY_API_KEY`, `GAMMA_BASE_URL`.
-- [SETUP-3] Create `src/__init__.py`, `src/shared/__init__.py`, `tests/__init__.py`, `tests/data/__init__.py`, `tests/model/__init__.py`.
+- [SETUP-1] `pyproject.toml` — declare dependencies: `pytest`, `pytest-cov`, `pytest-mock`, `respx`, `httpx`, `pydantic`, `yfinance`, `pandas`, `scikit-learn`, `joblib`, `python-dotenv`
+- [SETUP-2] `.env.example` — document `COINGECKO_BASE_URL`, `STOCK_SYMBOLS`, `CRYPTO_SYMBOLS`, `HORIZON_DAYS`, `CACHE_DIR`
+- [SETUP-3] `.gitignore` — add `models/`, `.env`, `__pycache__/`, `*.pyc`, `*.egg-info/`, `.pytest_cache/`
+- [SETUP-4] Stub `__init__.py` files: `src/`, `src/shared/`, `src/data/`, `src/model/`, `tests/`, `tests/data/`, `tests/model/`
 
 ### DATA tasks (implementer-data)
 
-- [D-1] **schemas.py** — Define `MarketFeatures` and `PredictionResult` Pydantic models in `src/shared/schemas.py`. This is the first task and BLOCKS all MODEL tasks.
-- [D-2] **gamma_client.py** — Fetch market metadata from Gamma API. Returns list of raw dicts. Depends on: D-1.
-- [D-3] **bitquery_client.py** — GraphQL query for resolved-market history per market. Depends on: D-1.
-- [D-4] **finfeed_client.py** — Fetch cross-venue OHLCV from FinFeedAPI. Fails loudly if key absent. Depends on: D-1.
-- [D-5] **normalizer.py** — Map raw API responses to `MarketFeatures`. Handles missing fields gracefully (log + skip, not crash). Depends on: D-2, D-3, D-4.
-- [D-6] **cache.py** — DiskCache class: save/load JSON blobs by key, with TTL. Depends on: nothing (pure utility).
-- [D-7] **pipeline.py** — Orchestrates: fetch via clients → normalize → cache. Exposes `get_features(market_ids: list[str]) -> list[MarketFeatures]`. Depends on: D-5, D-6.
-- [D-8] **tests/data/** — Unit tests for all data modules with mocked HTTP. Depends on: D-7.
+- **[D-1] `src/shared/schemas.py`** — Define `AssetOHLCV` and `PredictionResult` Pydantic models (see §3). **BLOCKER for all MODEL tasks.**
+- **[D-2] `src/data/yfinance_client.py`** — Wraps `yfinance.download`; returns list of `dict` (raw, not normalized). Accepts symbol + date range. Depends on: D-1.
+- **[D-3] `src/data/coingecko_client.py`** — Async httpx client for CoinGecko `/coins/{id}/market_chart/range`. Returns raw JSON. Implements exponential backoff on 429. Depends on: D-1.
+- **[D-4] `src/data/cache.py`** — `DiskCache` class: save/load Parquet (via pandas) keyed by symbol+date range, with TTL in hours. Depends on: nothing (pure utility).
+- **[D-5] `src/data/normalizer.py`** — Converts raw yfinance DataFrame and raw CoinGecko JSON into lists of `AssetOHLCV`. Handles missing/NaN values: log and skip the affected row, never crash. Depends on: D-2, D-3.
+- **[D-6] `src/data/pipeline.py`** — Orchestrates: check cache → fetch if stale → normalize → write cache → return sorted `list[AssetOHLCV]`. Public API: `get_ohlcv(symbols: list[str], start: date, end: date) -> list[AssetOHLCV]`. Depends on: D-4, D-5.
+- **[D-7] `tests/data/`** — Unit tests for D-2 through D-6; all HTTP mocked. Fixture files cover ≥90 calendar days each. Depends on: D-6.
 
 ### MODEL tasks (implementer-model)
 
-All MODEL tasks are blocked on D-1 (schemas.py).
+All MODEL tasks are **blocked on D-1** (schemas.py must exist before any model code imports from `src/shared/`).
 
-- [M-1] **features.py** — Engineer feature vectors from `MarketFeatures` (e.g. cross-venue basis, days-to-resolution, log-price). Depends on: D-1.
-- [M-2] **trainer.py** — Train a logistic regression (or ridge regression) baseline on historical resolved markets. Persists model artifact to `models/` dir. Depends on: M-1.
-- [M-3] **predictor.py** — Load persisted model, produce `PredictionResult` for a `MarketFeatures` input. Depends on: M-2.
-- [M-4] **evaluator.py** — Compute Brier score and log-loss over a list of resolved `PredictionResult` + outcomes. Depends on: M-3.
-- [M-5] **model_store.py** — Versioned save/load for model artifacts (joblib + metadata JSON). Depends on: M-2.
-- [M-6] **tests/model/** — Unit tests for all model modules with fixture data. Depends on: M-5, M-4.
+- **[M-1] `src/model/features.py`** — Computes per-asset features from a sorted `list[AssetOHLCV]`: log returns, 5/20-day momentum, 20-day rolling volatility, 5/20-day SMA crossover flag, volume z-score. All using only lagged data (no future leak). Returns a `pd.DataFrame` with symbol+date index. Depends on: D-1.
+- **[M-2] `src/model/splitter.py`** — Given a feature DataFrame with dates, produces train/val/test slices with a strict temporal cutoff (no shuffling). Configurable split fractions (default: 70/15/15). Depends on: M-1.
+- **[M-3] `src/model/trainer.py`** — Builds label column (1 if close[t+horizon] > close[t] else 0), fits `sklearn.linear_model.LogisticRegression` on train split, persists via `model_store`. Depends on: M-2, M-5 (model_store, can be developed in parallel with M-2 once M-1 is done).
+- **[M-4] `src/model/predictor.py`** — Loads persisted model via `model_store`, accepts a feature row, returns `PredictionResult`. Depends on: M-3.
+- **[M-5] `src/model/model_store.py`** — Saves/loads joblib model artifact alongside a metadata JSON (train date range, feature names, model version, symbol universe). Can be developed in parallel with M-2. Depends on: D-1.
+- **[M-6] `src/model/evaluator.py`** — Computes accuracy, AUC-ROC, Brier score, and a per-quarter performance breakdown over a list of `(PredictionResult, actual_outcome)` pairs. Depends on: M-4.
+- **[M-7] `tests/model/`** — Unit tests for M-1 through M-6. Must include a temporal-integrity assertion (no test date in train window). Depends on: M-6.
 
 ### Integration (after both DATA and MODEL complete)
 
-- [INT-1] `tests/test_pipeline_smoke.py` — Full path smoke test. Depends on: D-8, M-6.
-- [INT-2] Run `pytest --cov=src` and verify coverage targets. Depends on: INT-1.
+- **[INT-1] `tests/test_smoke.py`** — Full-path smoke test on synthetic fixture data, no mocks. Depends on: D-7, M-7.
+- **[INT-2] Coverage gate** — Run `pytest --cov=src --cov-fail-under=80`; confirm per-module targets met. Depends on: INT-1.
 
-### Dependency order summary
+### Dependency order (ASCII diagram)
 
 ```
-SETUP-1, SETUP-2, SETUP-3
-    └── D-1 (schemas)
-            ├── D-2, D-3, D-4 (clients) [parallel]
+SETUP-1..4
+    └── D-1 (schemas)  ← BLOCKER
+            ├── D-2 (yfinance client)
+            ├── D-3 (coingecko client)   [D-2, D-3 parallel]
             │       └── D-5 (normalizer)
-            │               └── D-7 (pipeline) ← D-6 (cache) [parallel with D-5]
-            │                       └── D-8 (data tests)
+            │               └── D-6 (pipeline) ← D-4 (cache) [parallel with D-5]
+            │                       └── D-7 (data tests)
             └── M-1 (features)
-                    └── M-2 (trainer) ← M-5 (model_store) [parallel with M-3]
-                            └── M-3 (predictor)
-                                    └── M-4 (evaluator)
-                                            └── M-6 (model tests)
-                                                    └── INT-1 → INT-2
+                    └── M-2 (splitter) ─────────────────────┐
+                                                             │
+                    M-5 (model_store, parallel with M-2) ───┤
+                                                             ▼
+                                                    M-3 (trainer)
+                                                         └── M-4 (predictor)
+                                                                  └── M-6 (evaluator)
+                                                                           └── M-7 (model tests)
+                                                                                    └── INT-1 → INT-2
 ```
 
 ---
 
-## 6. Environment Variables (`.env.example`)
+## 7. Environment Variables (`.env.example`)
 
 ```bash
-# Gamma API (public, no key needed for basic endpoints)
-GAMMA_BASE_URL=https://gamma-api.polymarket.com
+# CoinGecko base URL (override for testing or if using a Pro key later)
+COINGECKO_BASE_URL=https://api.coingecko.com/api/v3
 
-# FinFeedAPI — paid subscription required
-FINFEED_API_KEY=
+# Symbol universes (comma-separated)
+STOCK_SYMBOLS=AAPL,MSFT,GOOGL,AMZN,NVDA
+CRYPTO_SYMBOLS=bitcoin,ethereum,solana,bnb,ripple
 
-# Bitquery — free tier available, key required
-BITQUERY_API_KEY=
+# Prediction horizon in trading days
+HORIZON_DAYS=5
 
-# Optional: limit which market categories to fetch
-TARGET_CATEGORIES=politics,crypto,sports
+# Cache directory (relative to project root)
+CACHE_DIR=.cache
+
+# Minimum history in calendar days for training
+MIN_HISTORY_DAYS=90
 ```
+
+No secrets are required for the MVP. CoinGecko public endpoints and yfinance are both key-less. If yfinance is replaced with a paid provider, add that key here.
 
 ---
 
-## 7. Open Decisions (require team-lead resolution before Phase 2 starts)
+## 8. Open Decisions (1 remaining)
 
-1. **Which HTTP client?** `requests` (simpler) vs `httpx` (async-capable). Recommend `httpx` if implementer-data wants async pipeline; `requests` otherwise. Pick one — do not mix.
-2. **FinFeedAPI key availability**: if the key does not exist yet, D-4 and M-2 (training) will need to run against fixture data only. Is that acceptable for Phase 2?
-3. **Target market category for the baseline**: the handoff docs recommend starting narrow. Which category? (politics / crypto / sports)
-4. **Minimum resolved-market history window**: 30 days? 90 days? This affects whether there's enough data to train a non-trivial model.
+**Decision needed**: Is `yfinance` acceptable as the stock data source for MVP, given its Yahoo Finance ToS restrictions on commercial use?
+
+- If **yes**: proceed with `yfinance_client.py` as specified.
+- If **no**: replace with Alpha Vantage free tier (requires `ALPHAVANTAGE_API_KEY`; 25 req/day on free tier — sufficient for MVP with a small symbol universe). The client interface stays the same; only the implementation changes.
+
+No other open decisions remain.
