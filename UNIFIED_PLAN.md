@@ -33,7 +33,7 @@ The `py_construction/pred_bot.ipynb` notebook is empty and can be used for exper
 ### `src/data/` — Data Layer (owned by implementer-data)
 
 Responsible for:
-- Fetching OHLCV price history for a configured universe of stock tickers via `yfinance`
+- Fetching OHLCV price history for a configured universe of stock tickers via `yfinance`. Stock fetching MUST go through a `StockClient` Protocol/ABC defined in `src/shared/interfaces.py`. The yfinance-backed concrete class is `YFinanceClient` in `src/data/yfinance_client.py`; any future provider (Alpha Vantage, Polygon) implements the same Protocol.
 - Fetching OHLCV price history for a configured universe of crypto pairs via CoinGecko REST
 - Normalizing both sources into a canonical time-aligned panel of `AssetOHLCV` records
 - Persisting raw and processed data to disk (cache layer with TTL)
@@ -81,6 +81,7 @@ src/
   shared/
     __init__.py
     schemas.py               # AssetOHLCV + PredictionResult Pydantic models (see §1)
+    interfaces.py            # StockClient Protocol — swappable stock data provider abstraction
 
 tests/
   data/
@@ -229,7 +230,7 @@ A model trained on 90 days may capture a single market regime. Mitigations in th
 
 ### yfinance ToS for production
 
-yfinance is a scraper of Yahoo Finance data. It is widely used for research but Yahoo's ToS prohibit commercial redistribution. Flag this before any live deployment. Upgrade path: Alpha Vantage, Polygon.io, or Twelve Data (all have free tiers with API keys).
+yfinance is a scraper of Yahoo Finance data. It is widely used for research but Yahoo's ToS prohibit commercial redistribution. Flag this before any live deployment. Mitigation: stock fetching is implemented behind a `StockClient` Protocol so a licensed source can be swapped in by adding one concrete class and changing the constructor wiring.
 
 ### Small universe risk
 
@@ -255,6 +256,7 @@ Dependencies flow top to bottom. A task must not begin until all tasks it lists 
 ### DATA tasks (implementer-data)
 
 - **[D-1] `src/shared/schemas.py`** — Define `AssetOHLCV` and `PredictionResult` Pydantic models (see §3). **BLOCKER for all MODEL tasks.**
+- **[D-1b] `src/shared/interfaces.py`** — Define `StockClient` Protocol (or ABC): `get_ohlcv(symbol: str, start: date, end: date) -> list[dict]`. This interface must be defined before `yfinance_client.py` is implemented. Depends on: D-1.
 - **[D-2] `src/data/yfinance_client.py`** — Wraps `yfinance.download`; returns list of `dict` (raw, not normalized). Accepts symbol + date range. Depends on: D-1.
 - **[D-3] `src/data/coingecko_client.py`** — Async httpx client for CoinGecko `/coins/{id}/market_chart/range`. Returns raw JSON. Implements exponential backoff on 429. Depends on: D-1.
 - **[D-4] `src/data/cache.py`** — `DiskCache` class: save/load Parquet (via pandas) keyed by symbol+date range, with TTL in hours. Depends on: nothing (pure utility).
