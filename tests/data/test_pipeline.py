@@ -5,9 +5,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.data.cache import DiskCache
-from src.data.pipeline import DataPipeline
-from src.shared.schemas import AssetOHLCV
+from prediction_bot.data.cache import DiskCache
+from prediction_bot.data.pipeline import DataPipeline
+from prediction_bot.shared.schemas import AssetOHLCV
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -47,7 +47,7 @@ def test_get_ohlcv_stock(tmp_path):
 
 
 def test_get_ohlcv_crypto(tmp_path):
-    from src.data.coingecko_client import CoinGeckoClient
+    from prediction_bot.data.coingecko_client import CoinGeckoClient
     mock_crypto = MagicMock(spec=CoinGeckoClient)
     raw_data = _load_btc_coingecko()
     client = CoinGeckoClient(base_url="http://unused")
@@ -122,3 +122,20 @@ def test_get_ohlcv_empty_symbols(tmp_path):
     )
     results = pipeline.get_ohlcv([], START, END)
     assert results == []
+
+
+def test_pipeline_resolves_env_at_construction(monkeypatch, tmp_path):
+    """
+    Regression for O-6: env vars must be read at __init__ time, not module
+    import time, so test code (and future runtime reconfiguration) can set
+    STOCK_SYMBOLS / CRYPTO_SYMBOLS via os.environ without restarting.
+    """
+    monkeypatch.setenv("STOCK_SYMBOLS", "FOO,BAR")
+    monkeypatch.setenv("CRYPTO_SYMBOLS", "baz,qux")
+    pipeline = DataPipeline(
+        stock_client=MagicMock(),
+        crypto_client=MagicMock(),
+        cache=DiskCache(cache_dir=str(tmp_path)),
+    )
+    assert pipeline._stock_symbols == ["FOO", "BAR"]
+    assert pipeline._crypto_symbols == ["baz", "qux"]

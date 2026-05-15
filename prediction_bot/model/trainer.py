@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-from datetime import date
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
-from src.model.features import FEATURE_COLS
-from src.model.model_store import save_model
-from src.model.splitter import SplitResult
+from prediction_bot.model.features import FEATURE_COLS
+from prediction_bot.model.model_store import save_model
+from prediction_bot.model.splitter import SplitResult
 
 
 def build_labels(df: pd.DataFrame, horizon_days: int = 5) -> pd.Series:
@@ -21,23 +20,15 @@ def build_labels(df: pd.DataFrame, horizon_days: int = 5) -> pd.Series:
 
     df must have 'close' as a column and 'date' either as a column or MultiIndex level.
     """
-    result_parts = []
-
+    close = df["close"]
     if isinstance(df.index, pd.MultiIndex) and "symbol" in df.index.names:
-        for symbol, grp in df.groupby(level="symbol"):
-            close = grp["close"]
-            future_close = close.shift(-horizon_days)
-            labels = (future_close > close).astype(float)
-            labels[future_close.isna()] = float("nan")
-            result_parts.append(labels)
+        future_close = close.groupby(level="symbol", sort=False).shift(-horizon_days)
     else:
-        close = df["close"]
         future_close = close.shift(-horizon_days)
-        labels = (future_close > close).astype(float)
-        labels[future_close.isna()] = float("nan")
-        result_parts.append(labels)
 
-    return pd.concat(result_parts)
+    labels = (future_close > close).astype(float)
+    labels[future_close.isna()] = float("nan")
+    return labels
 
 
 def train(

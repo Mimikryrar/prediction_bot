@@ -3,7 +3,7 @@ from datetime import date
 
 import pandas as pd
 
-from src.shared.schemas import AssetOHLCV
+from prediction_bot.shared.schemas import AssetOHLCV
 
 logger = logging.getLogger(__name__)
 

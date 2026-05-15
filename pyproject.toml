@@ -26,14 +26,17 @@ dev = [
     "respx>=0.21",
 ]
 
+[project.scripts]
+prediction-bot = "prediction_bot.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["src*"]
+include = ["prediction_bot*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 
 [tool.coverage.run]
-source = ["src"]
-omit = ["src/__init__.py"]
+source = ["prediction_bot"]
+omit = ["prediction_bot/__init__.py"]

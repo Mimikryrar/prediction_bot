@@ -1,8 +1,8 @@
 import pandas as pd
 import pytest
 
-from src.model.features import build_feature_dataframe
-from src.model.splitter import temporal_split
+from prediction_bot.model.features import build_feature_dataframe
+from prediction_bot.model.splitter import temporal_split
 
 
 def test_no_test_date_in_train_window(sample_records):
@@ -57,12 +57,25 @@ def test_temporal_order_respected(sample_records):
 def test_custom_fractions(sample_records):
     df = build_feature_dataframe(sample_records).reset_index()
     split = temporal_split(df, train_frac=0.6, val_frac=0.2)
-    n = len(df)
-    assert len(split.train) == int(n * 0.6)
-    assert len(split.val) == int(n * (0.6 + 0.2)) - int(n * 0.6)
+    unique_dates = sorted(pd.to_datetime(df["date"]).unique())
+    train_dates = set(pd.to_datetime(split.train["date"]).unique())
+    val_dates = set(pd.to_datetime(split.val["date"]).unique())
+    test_dates = set(pd.to_datetime(split.test["date"]).unique())
+
+    assert len(split.train) + len(split.val) + len(split.test) == len(df)
+    assert train_dates
+    assert val_dates
+    assert train_dates.isdisjoint(val_dates)
+    assert val_dates.isdisjoint(test_dates)
+    assert train_dates | val_dates | test_dates == set(pd.to_datetime(unique_dates))
 
 
 def test_invalid_fractions_raises(sample_records):
     df = build_feature_dataframe(sample_records).reset_index()
     with pytest.raises(ValueError):
         temporal_split(df, train_frac=0.8, val_frac=0.3)
+
+
+def test_empty_dataframe_raises():
+    with pytest.raises(ValueError, match="empty DataFrame"):
+        temporal_split(pd.DataFrame(columns=["date"]))

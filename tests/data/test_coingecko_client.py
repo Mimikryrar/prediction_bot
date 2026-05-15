@@ -6,7 +6,7 @@ import httpx
 import pytest
 import respx
 
-from src.data.coingecko_client import CoinGeckoClient
+from prediction_bot.data.coingecko_client import CoinGeckoClient
 
 FIXTURES = Path(__file__).parent / "fixtures"
 BASE_URL = "http://test-coingecko.local/api/v3"

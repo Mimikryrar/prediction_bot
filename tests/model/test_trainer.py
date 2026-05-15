@@ -4,9 +4,9 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from src.model.features import build_feature_dataframe
-from src.model.splitter import temporal_split
-from src.model.trainer import train, build_labels
+from prediction_bot.model.features import build_feature_dataframe
+from prediction_bot.model.splitter import temporal_split
+from prediction_bot.model.trainer import train, build_labels
 
 
 def test_build_labels_no_lookahead(sample_records):
@@ -27,7 +27,7 @@ def test_train_produces_artifact(sample_records, tmp_model_path):
     val_df = split.val.set_index(["symbol", "date"])
     test_df = split.test.set_index(["symbol", "date"])
 
-    from src.model.splitter import SplitResult
+    from prediction_bot.model.splitter import SplitResult
     split_mi = SplitResult(
         train=train_df,
         val=val_df,
@@ -60,7 +60,7 @@ def test_trained_model_can_predict(sample_records, tmp_model_path):
     val_df = split.val.set_index(["symbol", "date"])
     test_df = split.test.set_index(["symbol", "date"])
 
-    from src.model.splitter import SplitResult
+    from prediction_bot.model.splitter import SplitResult
     split_mi = SplitResult(
         train=train_df, val=val_df, test=test_df,
         train_end_date=split.train_end_date,
@@ -75,7 +75,7 @@ def test_trained_model_can_predict(sample_records, tmp_model_path):
         artifact_path=tmp_model_path,
     )
 
-    from src.model.features import FEATURE_COLS
+    from prediction_bot.model.features import FEATURE_COLS
     test_row = split.test[FEATURE_COLS].iloc[0:1]
     proba = pipe.predict_proba(test_row)
     assert proba.shape == (1, 2)

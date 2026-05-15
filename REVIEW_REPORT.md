@@ -19,22 +19,22 @@
 
 **Runtime**: 3.03 s (full suite)
 
-**Coverage** (`pytest --cov=src --cov-report=term-missing`):
+**Coverage** (`pytest --cov=prediction_bot --cov-report=term-missing`):
 
 | Module | Stmts | Miss | Cover | Plan target |
 |---|---|---|---|---|
-| src/data/cache.py | 30 | 3 | 90% | 85% ✓ |
-| src/data/coingecko_client.py | 46 | 3 | 93% | 85% ✓ |
-| src/data/normalizer.py | 38 | 2 | 95% | 85% ✓ |
-| src/data/pipeline.py | 66 | 2 | 97% | 85% ✓ |
-| src/data/yfinance_client.py | 15 | 0 | 100% | 85% ✓ |
-| src/model/evaluator.py | 34 | 0 | 100% | 80% ✓ |
-| src/model/features.py | 36 | 1 | 97% | 80% ✓ |
-| src/model/model_store.py | 27 | 0 | 100% | 80% ✓ |
-| src/model/predictor.py | 20 | 0 | 100% | 80% ✓ |
-| src/model/splitter.py | 32 | 4 | 88% | 80% ✓ |
-| src/model/trainer.py | 41 | 6 | 85% | 80% ✓ |
-| src/shared/schemas.py | 20 | 0 | 100% | 100% ✓ |
+| prediction_bot/data/cache.py | 30 | 3 | 90% | 85% ✓ |
+| prediction_bot/data/coingecko_client.py | 46 | 3 | 93% | 85% ✓ |
+| prediction_bot/data/normalizer.py | 38 | 2 | 95% | 85% ✓ |
+| prediction_bot/data/pipeline.py | 66 | 2 | 97% | 85% ✓ |
+| prediction_bot/data/yfinance_client.py | 15 | 0 | 100% | 85% ✓ |
+| prediction_bot/model/evaluator.py | 34 | 0 | 100% | 80% ✓ |
+| prediction_bot/model/features.py | 36 | 1 | 97% | 80% ✓ |
+| prediction_bot/model/model_store.py | 27 | 0 | 100% | 80% ✓ |
+| prediction_bot/model/predictor.py | 20 | 0 | 100% | 80% ✓ |
+| prediction_bot/model/splitter.py | 32 | 4 | 88% | 80% ✓ |
+| prediction_bot/model/trainer.py | 41 | 6 | 85% | 80% ✓ |
+| prediction_bot/shared/schemas.py | 20 | 0 | 100% | 100% ✓ |
 | **TOTAL** | **409** | **21** | **95%** | — |
 
 All per-module coverage targets met. The missing lines are non-critical:
@@ -53,7 +53,7 @@ All per-module coverage targets met. The missing lines are non-critical:
 
 ### C-1 (MEDIUM): `log_return_1d` is not fully lagged — it uses `close[t]`
 
-**File**: `src/model/features.py:46`
+**File**: `prediction_bot/model/features.py:46`
 
 ```python
 log_ret = np.log(g["close"] / g["close"].shift(1))
@@ -69,13 +69,13 @@ Fix: shift `log_return_1d` by 1 before inclusion (i.e., `lagged_log_ret` is alre
 
 ### C-2 (LOW): `CoinGeckoClient._parse` approximates OHLCV from price ticks
 
-**File**: `src/data/coingecko_client.py:44-58`
+**File**: `prediction_bot/data/coingecko_client.py:44-58`
 
 The CoinGecko `/market_chart/range` endpoint returns intraday price ticks, not OHLCV candles. The client synthesizes open/high/low/close by treating the first tick of a day as open and the last as close. This is a reasonable approximation for daily data but produces open != exchange open and may produce a single-tick "candle" when the API returns sparse data. This is acknowledged nowhere in the code or plan. Not a bug per se, but a correctness note for future consumers.
 
 ### C-3 (LOW): `temporal_split` sorts by row position, not by date value
 
-**File**: `src/model/splitter.py:28-32`
+**File**: `prediction_bot/model/splitter.py:28-32`
 
 ```python
 sorted_df = sorted_df.iloc[pd.Series(dates).argsort().values]
@@ -89,7 +89,7 @@ The plan requires an integration smoke test (`tests/test_smoke.py`) that runs th
 
 ### C-5 (LOW): `DataPipeline` reads env vars at import time
 
-**File**: `src/data/pipeline.py:13-16`
+**File**: `prediction_bot/data/pipeline.py:13-16`
 
 Module-level `os.getenv(...)` calls execute when the module is first imported. This means test code that sets `STOCK_SYMBOLS` or `CRYPTO_SYMBOLS` via `monkeypatch.setenv` after import will not affect `_STOCK_SYMBOLS` / `_CRYPTO_SYMBOLS`. Tests currently work around this by injecting `stock_symbols` / `crypto_symbols` via the constructor, but the module-level globals are a footgun for future callers who forget to pass constructor arguments.
 
@@ -99,7 +99,7 @@ Module-level `os.getenv(...)` calls execute when the module is first imported. T
 
 ### S-1 (LOW): No input validation on symbol strings passed to cache key
 
-**File**: `src/data/cache.py:22-23`
+**File**: `prediction_bot/data/cache.py:22-23`
 
 ```python
 safe = symbol.replace("/", "_").replace("-", "_")
@@ -112,7 +112,7 @@ Recommendation: assert that the sanitized symbol matches `[A-Za-z0-9_]+` before 
 
 ### S-2 (LOW): `model_store.load_model` deserializes joblib without integrity check
 
-**File**: `src/model/model_store.py:58-63`
+**File**: `prediction_bot/model/model_store.py:58-63`
 
 `joblib.load` on an untrusted file is equivalent to `pickle.load` — arbitrary code execution. The current use case (loading from a local `models/` directory written by the same process) carries no practical risk. If the artifact path is ever derived from user input or a network path, this becomes critical. No fix needed now, but flag before any API or multi-tenant deployment.
 
@@ -175,7 +175,7 @@ Profile run: 50 iterations of `build_feature_dataframe` on the 83-row fixture pa
 
 ### O-1 (HIGH priority, correctness): Fix `log_return_1d` lookahead (see C-1)
 
-In `src/model/features.py`, change the output frame to use the already-computed `lagged_log_ret` (which is `log_ret.shift(1)`) instead of `log_ret` for the `log_return_1d` column. This eliminates the close[t] leak. The fix is a one-line change; `lagged_log_ret` is already computed on line 51.
+In `prediction_bot/model/features.py`, change the output frame to use the already-computed `lagged_log_ret` (which is `log_ret.shift(1)`) instead of `log_ret` for the `log_return_1d` column. This eliminates the close[t] leak. The fix is a one-line change; `lagged_log_ret` is already computed on line 51.
 
 ### O-2 (HIGH priority, plan compliance): Add `tests/test_smoke.py` (INT-1)
 
@@ -209,3 +209,46 @@ This is a one-line hardening that eliminates the path-traversal risk if symbols 
 ### O-6 (LOW): Move module-level `os.getenv` calls into `DataPipeline.__init__` (see C-5)
 
 Deferred env resolution makes the class safe for test monkeypatching without constructor injection.
+
+---
+
+## Phase 4 Remediation (2026-05-14)
+
+All six prioritized recommendations from the Phase 3 audit have landed on `unified-build`.
+
+### Final state
+
+- **Tests**: 61 passed / 61 total (was 45 — 16 new regression tests added)
+- **Coverage**: 96% (was 95%; data/cache.py 90% → 100%, model/predictor.py 100% → 100%)
+- **Runtime**: full suite in ~6 s
+
+### Outcomes per finding
+
+| ID | Title | Status | Notes |
+|---|---|---|---|
+| O-1 | `log_return_1d` lookahead | **Fixed** — `prediction_bot/model/features.py:55` now emits `lagged_log_ret` (i.e. `log(close[t-1]/close[t-2])`). Regression test `test_log_return_1d_is_fully_lagged` numerically verifies the shift. |
+| O-2 | End-to-end smoke test | **Added** — `tests/test_smoke.py` wires real `DataPipeline` → `build_feature_dataframe` → `train` → `Predictor` on 200 days of synthetic stock+crypto data. External clients are the only mocks; runtime ~2.8 s. |
+| O-3 | `Predictor` sklearn validation overhead | **Fixed** — `prediction_bot/model/predictor.py` caches `scaler.mean_` / `scaler.scale_` at `__init__` and calls `clf.predict_proba` directly on a NumPy array, bypassing `check_array` per call. Regression test `test_predict_matches_full_pipeline` confirms numerical equivalence to the full `Pipeline.predict_proba` within 1e-10. |
+| O-4 | Vectorize `build_feature_dataframe` | **Fixed** — rewrote `prediction_bot/model/features.py` to use native grouped `shift` + `rolling` over the full frame (replacing the per-symbol Python loop and the `transform(lambda)` fallbacks), plus a direct-attribute DataFrame builder that skips pydantic `model_dump`. Benchmark on 5 symbols × 250 days: **21.10 ms → 13.21 ms median per call (37.4% speedup)**, exceeding the 30% target. Output is bit-identical to the loop-based reference (0.00e+00 max abs diff on every feature column). |
+| O-5 | DiskCache path-traversal guard | **Fixed** — `prediction_bot/data/cache.py` validates `symbol` against `^[A-Za-z0-9_.\-]+$` before constructing the cache key path; raises `ValueError` otherwise. Covered by new `tests/data/test_cache.py`. |
+| O-6 | Env-var read at module import | **Fixed** — `prediction_bot/data/pipeline.py` defers `os.getenv("STOCK_SYMBOLS"/"CRYPTO_SYMBOLS"/"CACHE_DIR"/"COINGECKO_BASE_URL")` to `DataPipeline.__init__`. Regression test `test_pipeline_resolves_env_at_construction` confirms `monkeypatch.setenv` is honored without restart. |
+
+### Per-module coverage (post-remediation)
+
+| Module | Coverage | Δ |
+|---|---:|---|
+| prediction_bot/data/cache.py | 100% | +10 |
+| prediction_bot/data/coingecko_client.py | 93% | +0 |
+| prediction_bot/data/normalizer.py | 95% | +0 |
+| prediction_bot/data/pipeline.py | 97% | +0 |
+| prediction_bot/data/yfinance_client.py | 100% | +0 |
+| prediction_bot/model/evaluator.py | 100% | +0 |
+| prediction_bot/model/features.py | 100% | +3 |
+| prediction_bot/model/model_store.py | 100% | +0 |
+| prediction_bot/model/predictor.py | 100% | +0 |
+| prediction_bot/model/splitter.py | 88% | +0 |
+| prediction_bot/model/trainer.py | 85% | +0 |
+| prediction_bot/shared/schemas.py | 100% | +0 |
+| **TOTAL** | **96%** | **+1** |
+
+All plan-defined per-module gates still met. Integration phase is unblocked.

@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from src.model.features import build_feature_dataframe, FEATURE_COLS
+from prediction_bot.model.features import build_feature_dataframe, FEATURE_COLS
 
 
 def test_feature_columns_present(sample_records):
@@ -72,3 +72,24 @@ def test_all_feature_cols_finite_for_valid_rows(sample_records):
     assert len(valid) > 0
     for col in FEATURE_COLS:
         assert np.isfinite(valid[col]).all(), f"Non-finite values in {col}"
+
+
+def test_log_return_1d_is_fully_lagged(sample_records):
+    """
+    Regression for the lookahead leak (O-1): log_return_1d at row t must equal
+    log(close[t-1] / close[t-2]), NOT log(close[t] / close[t-1]). The label is
+    close[t+5] > close[t], so emitting log(close[t]/close[t-1]) at row t would
+    leak the label's denominator into the feature.
+    """
+    df = build_feature_dataframe(sample_records)
+    for symbol in df.index.get_level_values("symbol").unique():
+        sub = df.xs(symbol, level="symbol").sort_index()
+        closes = sub["close"].to_numpy()
+        actual = sub["log_return_1d"].to_numpy()
+        # In the post-dropna frame, `close` at row k holds the raw close for
+        # that day. The lagged 1-day log return at row k uses close[k-1] and
+        # close[k-2] of the same frame, since consecutive post-dropna rows are
+        # consecutive trading days (dropna only removes the 20-day warmup).
+        # The pre-fix bug emitted log(close[k]/close[k-1]) instead.
+        expected = np.log(closes[1:-1] / closes[:-2])  # for k in [2, N)
+        np.testing.assert_allclose(actual[2:], expected, rtol=0, atol=1e-12)

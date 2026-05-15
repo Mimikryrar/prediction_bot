@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 from datetime import date
 from pathlib import Path
@@ -8,6 +9,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 _DEFAULT_TTL_HOURS = 24
+_SYMBOL_PATTERN = re.compile(r"^[A-Za-z0-9_.\-]+$")
 
 
 class DiskCache:
@@ -19,6 +21,8 @@ class DiskCache:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _key_path(self, symbol: str, start: date, end: date) -> Path:
+        if not _SYMBOL_PATTERN.match(symbol):
+            raise ValueError(f"Invalid symbol for cache key: {symbol!r}")
         safe = symbol.replace("/", "_").replace("-", "_")
         return self.cache_dir / f"{safe}__{start.isoformat()}__{end.isoformat()}.parquet"
 

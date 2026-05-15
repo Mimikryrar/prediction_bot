@@ -4,7 +4,7 @@ from datetime import date
 
 import pytest
 
-from src.shared.schemas import AssetOHLCV
+from prediction_bot.shared.schemas import AssetOHLCV
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
 

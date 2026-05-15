@@ -2,8 +2,8 @@ from datetime import date
 
 import pytest
 
-from src.data.normalizer import normalize_crypto_records, normalize_stock_records, to_dataframe
-from src.shared.schemas import AssetOHLCV
+from prediction_bot.data.normalizer import normalize_crypto_records, normalize_stock_records, to_dataframe
+from prediction_bot.shared.schemas import AssetOHLCV
 
 
 def _make_row(d=date(2024, 1, 2), price=100.0, vol=1_000_000.0):
@@ -33,7 +33,7 @@ def test_normalize_stock_skips_missing_field():
 
 
 def test_normalize_crypto_basic(btc_coingecko_response):
-    from src.data.coingecko_client import CoinGeckoClient
+    from prediction_bot.data.coingecko_client import CoinGeckoClient
     client = CoinGeckoClient(base_url="http://unused")
     raw = client._parse(btc_coingecko_response, "bitcoin")
     result = normalize_crypto_records(raw, "bitcoin")

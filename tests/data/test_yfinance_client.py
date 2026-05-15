@@ -6,8 +6,8 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 
-from src.data.yfinance_client import YFinanceClient
-from src.shared.interfaces import StockClient
+from prediction_bot.data.yfinance_client import YFinanceClient
+from prediction_bot.shared.interfaces import StockClient
 
 FIXTURES = Path(__file__).parent / "fixtures"
 

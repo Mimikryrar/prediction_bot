@@ -30,21 +30,21 @@ The `py_construction/pred_bot.ipynb` notebook is empty and can be used for exper
 
 ## 1. Module Boundaries
 
-### `src/data/` — Data Layer (owned by implementer-data)
+### `prediction_bot/data/` — Data Layer (owned by implementer-data)
 
 Responsible for:
-- Fetching OHLCV price history for a configured universe of stock tickers via `yfinance`. Stock fetching MUST go through a `StockClient` Protocol/ABC defined in `src/shared/interfaces.py`. The yfinance-backed concrete class is `YFinanceClient` in `src/data/yfinance_client.py`; any future provider (Alpha Vantage, Polygon) implements the same Protocol.
+- Fetching OHLCV price history for a configured universe of stock tickers via `yfinance`. Stock fetching MUST go through a `StockClient` Protocol/ABC defined in `prediction_bot/shared/interfaces.py`. The yfinance-backed concrete class is `YFinanceClient` in `prediction_bot/data/yfinance_client.py`; any future provider (Alpha Vantage, Polygon) implements the same Protocol.
 - Fetching OHLCV price history for a configured universe of crypto pairs via CoinGecko REST
 - Normalizing both sources into a canonical time-aligned panel of `AssetOHLCV` records
 - Persisting raw and processed data to disk (cache layer with TTL)
 - Providing a clean, side-effect-free interface: given a list of symbols and a date range, return a normalized panel ready for feature engineering
 
 Does NOT:
-- Define or compute features (that is `src/model/features.py`)
+- Define or compute features (that is `prediction_bot/model/features.py`)
 - Run models or produce predictions
 - Access any wallet, signing, or execution infrastructure
 
-### `src/model/` — Model Layer (owned by implementer-model)
+### `prediction_bot/model/` — Model Layer (owned by implementer-model)
 
 Responsible for:
 - Engineering time-series features from the normalized OHLCV panel (returns, momentum, volatility, moving-average crossovers)
@@ -55,13 +55,13 @@ Responsible for:
 - Evaluating model quality: accuracy, AUC-ROC, Brier score, calibration curve
 
 Does NOT:
-- Fetch or cache data (all data comes from `src/data/`)
+- Fetch or cache data (all data comes from `prediction_bot/data/`)
 - Manage secrets or API credentials
 - Implement any execution logic
 
-### `src/shared/` — Shared Contract (owned by implementer-data, written first)
+### `prediction_bot/shared/` — Shared Contract (owned by implementer-data, written first)
 
-Single file: `src/shared/schemas.py`. Defines the Pydantic models that form the handoff between the two modules. Neither module imports from the other — only from `src/shared/`.
+Single file: `prediction_bot/shared/schemas.py`. Defines the Pydantic models that form the handoff between the two modules. Neither module imports from the other — only from `prediction_bot/shared/`.
 
 ---
 
@@ -135,11 +135,11 @@ src/__init__.py
 tests/__init__.py
 ```
 
-**Ownership rule for `src/shared/schemas.py`**: implementer-data creates and owns this file. Any change to the schema after both implementers have started requires agreement from both parties — raise a question to the planner or team lead before modifying.
+**Ownership rule for `prediction_bot/shared/schemas.py`**: implementer-data creates and owns this file. Any change to the schema after both implementers have started requires agreement from both parties — raise a question to the planner or team lead before modifying.
 
 ---
 
-## 3. Shared Interface (Pydantic schemas in `src/shared/schemas.py`)
+## 3. Shared Interface (Pydantic schemas in `prediction_bot/shared/schemas.py`)
 
 ```python
 from pydantic import BaseModel
@@ -166,7 +166,7 @@ class PredictionResult(BaseModel):
     model_version: str
 ```
 
-`src/data/` produces lists of `AssetOHLCV`. `src/model/` consumes them and emits `PredictionResult`.
+`prediction_bot/data/` produces lists of `AssetOHLCV`. `prediction_bot/model/` consumes them and emits `PredictionResult`.
 
 ---
 
@@ -192,9 +192,9 @@ Fixtures live under `tests/data/fixtures/` and `tests/model/fixtures/`. They mus
 
 ### Coverage targets
 
-- `src/data/`: **85%** line coverage minimum
-- `src/model/`: **80%** line coverage minimum
-- `src/shared/schemas.py`: **100%** (all Pydantic field validation paths exercised)
+- `prediction_bot/data/`: **85%** line coverage minimum
+- `prediction_bot/model/`: **80%** line coverage minimum
+- `prediction_bot/shared/schemas.py`: **100%** (all Pydantic field validation paths exercised)
 
 ### Temporal integrity requirement
 
@@ -251,35 +251,35 @@ Dependencies flow top to bottom. A task must not begin until all tasks it lists 
 - [SETUP-1] `pyproject.toml` — declare dependencies: `pytest`, `pytest-cov`, `pytest-mock`, `respx`, `httpx`, `pydantic`, `yfinance`, `pandas`, `scikit-learn`, `joblib`, `python-dotenv`
 - [SETUP-2] `.env.example` — document `COINGECKO_BASE_URL`, `STOCK_SYMBOLS`, `CRYPTO_SYMBOLS`, `HORIZON_DAYS`, `CACHE_DIR`
 - [SETUP-3] `.gitignore` — add `models/`, `.env`, `__pycache__/`, `*.pyc`, `*.egg-info/`, `.pytest_cache/`
-- [SETUP-4] Stub `__init__.py` files: `src/`, `src/shared/`, `src/data/`, `src/model/`, `tests/`, `tests/data/`, `tests/model/`
+- [SETUP-4] Stub `__init__.py` files: `prediction_bot/`, `prediction_bot/shared/`, `prediction_bot/data/`, `prediction_bot/model/`, `tests/`, `tests/data/`, `tests/model/`
 
 ### DATA tasks (implementer-data)
 
-- **[D-1] `src/shared/schemas.py`** — Define `AssetOHLCV` and `PredictionResult` Pydantic models (see §3). **BLOCKER for all MODEL tasks.**
-- **[D-1b] `src/shared/interfaces.py`** — Define `StockClient` Protocol (or ABC): `get_ohlcv(symbol: str, start: date, end: date) -> list[dict]`. This interface must be defined before `yfinance_client.py` is implemented. Depends on: D-1.
-- **[D-2] `src/data/yfinance_client.py`** — Wraps `yfinance.download`; returns list of `dict` (raw, not normalized). Accepts symbol + date range. Depends on: D-1.
-- **[D-3] `src/data/coingecko_client.py`** — Async httpx client for CoinGecko `/coins/{id}/market_chart/range`. Returns raw JSON. Implements exponential backoff on 429. Depends on: D-1.
-- **[D-4] `src/data/cache.py`** — `DiskCache` class: save/load Parquet (via pandas) keyed by symbol+date range, with TTL in hours. Depends on: nothing (pure utility).
-- **[D-5] `src/data/normalizer.py`** — Converts raw yfinance DataFrame and raw CoinGecko JSON into lists of `AssetOHLCV`. Handles missing/NaN values: log and skip the affected row, never crash. Depends on: D-2, D-3.
-- **[D-6] `src/data/pipeline.py`** — Orchestrates: check cache → fetch if stale → normalize → write cache → return sorted `list[AssetOHLCV]`. Public API: `get_ohlcv(symbols: list[str], start: date, end: date) -> list[AssetOHLCV]`. Depends on: D-4, D-5.
+- **[D-1] `prediction_bot/shared/schemas.py`** — Define `AssetOHLCV` and `PredictionResult` Pydantic models (see §3). **BLOCKER for all MODEL tasks.**
+- **[D-1b] `prediction_bot/shared/interfaces.py`** — Define `StockClient` Protocol (or ABC): `get_ohlcv(symbol: str, start: date, end: date) -> list[dict]`. This interface must be defined before `yfinance_client.py` is implemented. Depends on: D-1.
+- **[D-2] `prediction_bot/data/yfinance_client.py`** — Wraps `yfinance.download`; returns list of `dict` (raw, not normalized). Accepts symbol + date range. Depends on: D-1.
+- **[D-3] `prediction_bot/data/coingecko_client.py`** — Async httpx client for CoinGecko `/coins/{id}/market_chart/range`. Returns raw JSON. Implements exponential backoff on 429. Depends on: D-1.
+- **[D-4] `prediction_bot/data/cache.py`** — `DiskCache` class: save/load Parquet (via pandas) keyed by symbol+date range, with TTL in hours. Depends on: nothing (pure utility).
+- **[D-5] `prediction_bot/data/normalizer.py`** — Converts raw yfinance DataFrame and raw CoinGecko JSON into lists of `AssetOHLCV`. Handles missing/NaN values: log and skip the affected row, never crash. Depends on: D-2, D-3.
+- **[D-6] `prediction_bot/data/pipeline.py`** — Orchestrates: check cache → fetch if stale → normalize → write cache → return sorted `list[AssetOHLCV]`. Public API: `get_ohlcv(symbols: list[str], start: date, end: date) -> list[AssetOHLCV]`. Depends on: D-4, D-5.
 - **[D-7] `tests/data/`** — Unit tests for D-2 through D-6; all HTTP mocked. Fixture files cover ≥90 calendar days each. Depends on: D-6.
 
 ### MODEL tasks (implementer-model)
 
-All MODEL tasks are **blocked on D-1** (schemas.py must exist before any model code imports from `src/shared/`).
+All MODEL tasks are **blocked on D-1** (schemas.py must exist before any model code imports from `prediction_bot/shared/`).
 
-- **[M-1] `src/model/features.py`** — Computes per-asset features from a sorted `list[AssetOHLCV]`: log returns, 5/20-day momentum, 20-day rolling volatility, 5/20-day SMA crossover flag, volume z-score. All using only lagged data (no future leak). Returns a `pd.DataFrame` with symbol+date index. Depends on: D-1.
-- **[M-2] `src/model/splitter.py`** — Given a feature DataFrame with dates, produces train/val/test slices with a strict temporal cutoff (no shuffling). Configurable split fractions (default: 70/15/15). Depends on: M-1.
-- **[M-3] `src/model/trainer.py`** — Builds label column (1 if close[t+horizon] > close[t] else 0), fits `sklearn.linear_model.LogisticRegression` on train split, persists via `model_store`. Depends on: M-2, M-5 (model_store, can be developed in parallel with M-2 once M-1 is done).
-- **[M-4] `src/model/predictor.py`** — Loads persisted model via `model_store`, accepts a feature row, returns `PredictionResult`. Depends on: M-3.
-- **[M-5] `src/model/model_store.py`** — Saves/loads joblib model artifact alongside a metadata JSON (train date range, feature names, model version, symbol universe). Can be developed in parallel with M-2. Depends on: D-1.
-- **[M-6] `src/model/evaluator.py`** — Computes accuracy, AUC-ROC, Brier score, and a per-quarter performance breakdown over a list of `(PredictionResult, actual_outcome)` pairs. Depends on: M-4.
+- **[M-1] `prediction_bot/model/features.py`** — Computes per-asset features from a sorted `list[AssetOHLCV]`: log returns, 5/20-day momentum, 20-day rolling volatility, 5/20-day SMA crossover flag, volume z-score. All using only lagged data (no future leak). Returns a `pd.DataFrame` with symbol+date index. Depends on: D-1.
+- **[M-2] `prediction_bot/model/splitter.py`** — Given a feature DataFrame with dates, produces train/val/test slices with a strict temporal cutoff (no shuffling). Configurable split fractions (default: 70/15/15). Depends on: M-1.
+- **[M-3] `prediction_bot/model/trainer.py`** — Builds label column (1 if close[t+horizon] > close[t] else 0), fits `sklearn.linear_model.LogisticRegression` on train split, persists via `model_store`. Depends on: M-2, M-5 (model_store, can be developed in parallel with M-2 once M-1 is done).
+- **[M-4] `prediction_bot/model/predictor.py`** — Loads persisted model via `model_store`, accepts a feature row, returns `PredictionResult`. Depends on: M-3.
+- **[M-5] `prediction_bot/model/model_store.py`** — Saves/loads joblib model artifact alongside a metadata JSON (train date range, feature names, model version, symbol universe). Can be developed in parallel with M-2. Depends on: D-1.
+- **[M-6] `prediction_bot/model/evaluator.py`** — Computes accuracy, AUC-ROC, Brier score, and a per-quarter performance breakdown over a list of `(PredictionResult, actual_outcome)` pairs. Depends on: M-4.
 - **[M-7] `tests/model/`** — Unit tests for M-1 through M-6. Must include a temporal-integrity assertion (no test date in train window). Depends on: M-6.
 
 ### Integration (after both DATA and MODEL complete)
 
 - **[INT-1] `tests/test_smoke.py`** — Full-path smoke test on synthetic fixture data, no mocks. Depends on: D-7, M-7.
-- **[INT-2] Coverage gate** — Run `pytest --cov=src --cov-fail-under=80`; confirm per-module targets met. Depends on: INT-1.
+- **[INT-2] Coverage gate** — Run `pytest --cov=prediction_bot --cov-fail-under=80`; confirm per-module targets met. Depends on: INT-1.
 
 ### Dependency order (ASCII diagram)
 

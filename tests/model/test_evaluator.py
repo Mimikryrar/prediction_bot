@@ -2,8 +2,8 @@ from datetime import date, timedelta
 
 import pytest
 
-from src.model.evaluator import evaluate, EvalMetrics
-from src.shared.schemas import PredictionResult
+from prediction_bot.model.evaluator import evaluate, EvalMetrics
+from prediction_bot.shared.schemas import PredictionResult
 
 
 def _make_result(p_up: float, d: date, symbol: str = "AAPL") -> PredictionResult:
@@ -76,3 +76,24 @@ def test_single_class_auc_is_nan():
     import math
     metrics = evaluate(results)
     assert math.isnan(metrics.auc_roc)
+
+
+def test_calibration_output_present():
+    base = date(2023, 1, 3)
+    results = [
+        (_make_result(0.1, base + timedelta(days=0)), 0),
+        (_make_result(0.2, base + timedelta(days=1)), 0),
+        (_make_result(0.8, base + timedelta(days=2)), 1),
+        (_make_result(0.9, base + timedelta(days=3)), 1),
+    ]
+    metrics = evaluate(results, calibration_bins=4)
+    assert len(metrics.calibration_pred) > 0
+    assert len(metrics.calibration_pred) == len(metrics.calibration_true)
+    assert all(0.0 <= x <= 1.0 for x in metrics.calibration_pred)
+    assert all(0.0 <= x <= 1.0 for x in metrics.calibration_true)
+
+
+def test_invalid_calibration_bins_raises():
+    base = date(2023, 1, 3)
+    with pytest.raises(ValueError, match="calibration_bins"):
+        evaluate([(_make_result(0.5, base), 1)], calibration_bins=0)
