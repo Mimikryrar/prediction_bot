@@ -11,6 +11,7 @@ from sklearn.preprocessing import StandardScaler
 from prediction_bot.model.features import FEATURE_COLS
 from prediction_bot.model.model_store import save_model
 from prediction_bot.model.splitter import SplitResult
+from typing import Any, Optional
 
 
 def build_labels(df: pd.DataFrame, horizon_days: int = 5) -> pd.Series:
@@ -38,16 +39,25 @@ def train(
     model_version: str = "v1",
     symbol_universe: List[str],
     artifact_path: Path,
+    feature_names: Optional[List[str]] = None,
+    regime_hmm: Any = None,
+    regime_n_states: int = 0,
 ) -> Pipeline:
     """
     Fit a logistic regression on the train split, persist the artifact.
     Returns the fitted sklearn Pipeline (scaler + logistic regression).
+
+    If `regime_hmm` is provided, it is persisted alongside the artifact and
+    `feature_names` is expected to already include the lagged regime columns
+    that the caller attached to the split.
     """
     train_df = split.train.copy()
     labels = build_labels(train_df, horizon_days=horizon_days)
 
+    effective_features = feature_names or FEATURE_COLS
+
     valid_mask = labels.notna()
-    X_train = train_df.loc[valid_mask, FEATURE_COLS]
+    X_train = train_df.loc[valid_mask, effective_features]
     y_train = labels[valid_mask]
 
     pipe = Pipeline([
@@ -65,15 +75,20 @@ def train(
     train_start = pd.Timestamp(dates.min()).date()
     train_end = pd.Timestamp(dates.max()).date()
 
+    extra: dict = {"horizon_days": horizon_days}
+    if regime_n_states > 0:
+        extra["regime_n_states"] = regime_n_states
+
     save_model(
         pipe,
         artifact_path,
         model_version=model_version,
         symbol_universe=symbol_universe,
-        feature_names=FEATURE_COLS,
+        feature_names=list(effective_features),
         train_start=train_start,
         train_end=train_end,
-        extra={"horizon_days": horizon_days},
+        extra=extra,
+        regime_hmm=regime_hmm,
     )
 
     return pipe

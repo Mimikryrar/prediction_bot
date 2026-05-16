@@ -7,7 +7,7 @@ import pandas as pd
 
 import runpy
 
-from prediction_bot.cli import build_parser, cmd_evaluate, cmd_predict, cmd_train
+from prediction_bot.cli import build_parser, cmd_backtest, cmd_evaluate, cmd_predict, cmd_train
 from prediction_bot.model.splitter import SplitResult
 from prediction_bot.shared.schemas import PredictionResult
 
@@ -21,6 +21,17 @@ class DummyPipeline:
 
 
 class DummyPredictor:
+    feature_cols = (
+        "log_return_1d",
+        "momentum_5d",
+        "momentum_20d",
+        "volatility_20d",
+        "sma_cross_5_20",
+        "volume_zscore",
+    )
+    regime_n_states = 0
+    regime_hmm = None
+
     def __init__(self, artifact_path):
         self.artifact_path = artifact_path
 
@@ -50,6 +61,71 @@ def test_parser_builds_subcommands():
         "2023-06-01",
     ])
     assert args.command == "train"
+    assert args.regime_states == 0
+
+
+def test_parser_accepts_regime_states_flag():
+    parser = build_parser()
+    args = parser.parse_args([
+        "train",
+        "--symbols", "AAPL",
+        "--start-date", "2023-01-01",
+        "--end-date", "2023-06-01",
+        "--regime-states", "3",
+    ])
+    assert args.regime_states == 3
+
+
+def test_cmd_train_regime_path(monkeypatch, tmp_path, capsys):
+    """Train with --regime-states 2 — exercises HMM fit, attach, and persistence wiring."""
+    import numpy as np
+    rng = np.random.default_rng(0)
+    n = 60
+    dates = pd.date_range("2023-01-02", periods=n, freq="B")
+    rows = []
+    for i, d in enumerate(dates):
+        rows.append({
+            "symbol": "AAPL",
+            "date": d,
+            "close": 100.0 + i * 0.5,
+            "log_return_1d": float(rng.normal(0.0005, 0.01)),
+            "momentum_5d": float(rng.normal(0.0, 0.02)),
+            "momentum_20d": float(rng.normal(0.0, 0.03)),
+            "volatility_20d": 0.01,
+            "sma_cross_5_20": 1.0,
+            "volume_zscore": 0.0,
+        })
+    feats = pd.DataFrame(rows)
+
+    monkeypatch.setattr("prediction_bot.cli.DataPipeline", lambda **kwargs: DummyPipeline([object()]))
+    monkeypatch.setattr("prediction_bot.cli.build_feature_dataframe", lambda records: feats.set_index(["symbol", "date"]))
+    monkeypatch.setattr(
+        "prediction_bot.cli.temporal_split",
+        lambda df, train_frac, val_frac: SplitResult(
+            df.iloc[:40], df.iloc[40:50], df.iloc[50:], dates[39], dates[49],
+        ),
+    )
+
+    captured = {}
+
+    def _fake_train(*args, **kwargs):
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr("prediction_bot.cli.train", _fake_train)
+
+    args = build_parser().parse_args([
+        "train",
+        "--symbols", "AAPL",
+        "--start-date", "2023-01-01",
+        "--end-date", "2023-06-01",
+        "--artifact-path", str(tmp_path / "model.joblib"),
+        "--regime-states", "2",
+    ])
+    assert cmd_train(args) == 0
+    assert captured["regime_n_states"] == 2
+    assert captured["regime_hmm"] is not None
+    assert "regime_1" in captured["feature_names"]
 
 
 def test_module_entrypoint_smoke(monkeypatch):
@@ -163,3 +239,39 @@ def test_cmd_evaluate_runs(monkeypatch, tmp_path, capsys):
     assert cmd_evaluate(args) == 0
     out = capsys.readouterr().out
     assert '"accuracy"' in out
+
+
+def test_cmd_backtest_runs(monkeypatch, tmp_path, capsys):
+    df = pd.DataFrame([
+        {"symbol": "AAPL", "date": pd.Timestamp("2023-01-01"), "close": 100.0, "log_return_1d": 0.1, "momentum_5d": 0.2, "momentum_20d": 0.3, "volatility_20d": 0.4, "sma_cross_5_20": 1.0, "volume_zscore": 0.5},
+        {"symbol": "AAPL", "date": pd.Timestamp("2023-01-02"), "close": 101.0, "log_return_1d": 0.1, "momentum_5d": 0.2, "momentum_20d": 0.3, "volatility_20d": 0.4, "sma_cross_5_20": 1.0, "volume_zscore": 0.5},
+        {"symbol": "AAPL", "date": pd.Timestamp("2023-01-03"), "close": 103.0, "log_return_1d": 0.1, "momentum_5d": 0.2, "momentum_20d": 0.3, "volatility_20d": 0.4, "sma_cross_5_20": 1.0, "volume_zscore": 0.5},
+    ])
+    monkeypatch.setattr("prediction_bot.cli.DataPipeline", lambda **kwargs: DummyPipeline([object()]))
+    monkeypatch.setattr("prediction_bot.cli.build_feature_dataframe", lambda records: df)
+    monkeypatch.setattr(
+        "prediction_bot.cli.temporal_split",
+        lambda df, train_frac, val_frac: SplitResult(df.iloc[:3], df.iloc[:0], df.iloc[:0], pd.Timestamp("2023-01-03"), pd.Timestamp("2023-01-03")),
+    )
+    monkeypatch.setattr("prediction_bot.cli.Predictor", DummyPredictor)
+    monkeypatch.setattr("prediction_bot.cli.build_labels", lambda part, horizon_days: pd.Series([1.0, 1.0, float('nan')], index=part.index))
+
+    artifact = tmp_path / "model.joblib"
+    artifact.write_text("stub")
+    pred_csv = tmp_path / "backtest_predictions.csv"
+    summary_json = tmp_path / "backtest_summary.json"
+    args = build_parser().parse_args([
+        "backtest",
+        "--symbols", "AAPL",
+        "--start-date", "2023-01-01",
+        "--end-date", "2023-06-01",
+        "--artifact-path", str(artifact),
+        "--partition", "train",
+        "--predictions-output-path", str(pred_csv),
+        "--output-path", str(summary_json),
+        "--threshold", "0.55",
+    ])
+    assert cmd_backtest(args) == 0
+    assert pred_csv.exists()
+    assert summary_json.exists()
+    assert "Saved output to" in capsys.readouterr().out

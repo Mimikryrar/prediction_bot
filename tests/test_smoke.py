@@ -18,6 +18,13 @@ from prediction_bot.data.cache import DiskCache
 from prediction_bot.data.pipeline import DataPipeline
 from prediction_bot.model.features import FEATURE_COLS, build_feature_dataframe
 from prediction_bot.model.predictor import Predictor
+from prediction_bot.model.regime import (
+    attach_regime_features,
+    compute_market_returns,
+    fit_regime_hmm,
+    predict_regimes,
+    regime_feature_columns,
+)
 from prediction_bot.model.splitter import SplitResult, temporal_split
 from prediction_bot.model.trainer import train
 from prediction_bot.shared.schemas import PredictionResult
@@ -105,3 +112,75 @@ def test_smoke_end_to_end(tmp_path):
     assert 0.0 <= result.confidence <= 1.0
     assert result.model_version == "smoke_v1"
     assert result.horizon_days == 5
+
+
+def test_smoke_end_to_end_with_regime(tmp_path):
+    """Same pipeline but with --regime-states 2: HMM is fit on train, persisted, and loaded by Predictor."""
+    n_days = 250
+    stock_raw = _synth_ohlcv("AAPL", n_days, seed=11)
+    crypto_raw = _synth_ohlcv("bitcoin", n_days, seed=12)
+
+    mock_stock = MagicMock()
+    mock_stock.get_ohlcv.return_value = stock_raw
+    mock_crypto = MagicMock()
+    mock_crypto.get_ohlcv.return_value = crypto_raw
+
+    pipeline = DataPipeline(
+        stock_client=mock_stock,
+        crypto_client=mock_crypto,
+        cache=DiskCache(cache_dir=str(tmp_path / "cache")),
+        stock_symbols=["AAPL"],
+        crypto_symbols=["bitcoin"],
+    )
+    records = pipeline.get_ohlcv(["AAPL", "bitcoin"], stock_raw[0]["date"], stock_raw[-1]["date"])
+    feats = build_feature_dataframe(records).reset_index()
+    split = temporal_split(feats)
+    split_mi = SplitResult(
+        train=split.train.set_index(["symbol", "date"]),
+        val=split.val.set_index(["symbol", "date"]),
+        test=split.test.set_index(["symbol", "date"]),
+        train_end_date=split.train_end_date,
+        val_end_date=split.val_end_date,
+    )
+
+    n_states = 2
+    market_returns_train = compute_market_returns(split_mi.train)
+    hmm = fit_regime_hmm(market_returns_train, n_states=n_states)
+
+    def _attach(df):
+        states = predict_regimes(hmm, compute_market_returns(df))
+        return attach_regime_features(df, states, n_states)
+
+    split_mi = SplitResult(
+        train=_attach(split_mi.train),
+        val=_attach(split_mi.val),
+        test=_attach(split_mi.test),
+        train_end_date=split_mi.train_end_date,
+        val_end_date=split_mi.val_end_date,
+    )
+    regime_cols = regime_feature_columns(n_states)
+    feature_names = list(FEATURE_COLS) + regime_cols
+
+    artifact = tmp_path / "smoke_regime.joblib"
+    train(
+        split_mi,
+        horizon_days=5,
+        model_version="smoke_regime_v1",
+        symbol_universe=["AAPL", "bitcoin"],
+        artifact_path=artifact,
+        feature_names=feature_names,
+        regime_hmm=hmm,
+        regime_n_states=n_states,
+    )
+    assert artifact.exists()
+    assert artifact.with_suffix(".regime.joblib").exists()
+
+    predictor = Predictor(artifact)
+    assert predictor.regime_n_states == n_states
+    assert predictor.regime_hmm is not None
+    assert tuple(predictor.feature_cols) == tuple(feature_names)
+
+    test_row = split_mi.test[feature_names].iloc[0].to_dict()
+    result = predictor.predict("AAPL", test_row, date(2024, 1, 1))
+    assert 0.0 <= result.p_up <= 1.0
+    assert result.model_version == "smoke_regime_v1"

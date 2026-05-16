@@ -38,6 +38,12 @@ prediction-bot train \
   --output-path models/v1_train_summary.json
 ```
 
+To add HMM-based market regime detection as a feature (fit on the train window only, persisted alongside the artifact), pass `--regime-states N` where N is the number of regimes (>=2):
+```bash
+prediction-bot train ... --regime-states 2
+```
+Downstream `predict`/`evaluate`/`backtest` automatically pick up the regime HMM from the artifact metadata — no extra flags needed.
+
 Predict:
 ```bash
 prediction-bot predict \
@@ -58,6 +64,19 @@ prediction-bot evaluate \
   --output-path models/v1_test_metrics.json
 ```
 
+Backtest:
+```bash
+prediction-bot backtest \
+  --symbols AAPL \
+  --start-date 2023-01-01 \
+  --end-date 2024-01-01 \
+  --artifact-path models/v1.joblib \
+  --partition test \
+  --threshold 0.55 \
+  --predictions-output-path models/backtest_predictions.csv \
+  --output-path models/backtest_summary.json
+```
+
 You can also run it as:
 ```bash
 python3 -m prediction_bot ...
@@ -65,5 +84,8 @@ python3 -m prediction_bot ...
 
 ## Notes
 - Temporal splits are date-boundary-based.
-- Model artifacts are trusted-local files only.
+- Model artifacts are trusted-local files only — `joblib.load` executes pickle, so only load artifacts produced by `save_model` from a path you trust.
 - External API calls are mocked in tests.
+
+## Status
+Research project, not production. The `yfinance` data source is used for local research only; deploying this bot against production trading flow would require swapping `yfinance_client.py` for a licensed market data feed.

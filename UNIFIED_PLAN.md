@@ -1,5 +1,8 @@
 # Stock & Crypto Price Prediction Bot — Unified Build Plan
 
+> **Status: ARCHIVAL.** This is the original build plan as written before implementation. Paths reference `src/` which was renamed to `prediction_bot/` during the final refactor (commit `1634cd4`). Keep for historical context; do not treat as living documentation.
+
+
 > Authored by: planner (Phase 1, revised)
 > Date: 2026-05-11
 > Branch: unified-build

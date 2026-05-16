@@ -13,6 +13,13 @@ from prediction_bot.model.evaluator import evaluate
 from prediction_bot.model.features import FEATURE_COLS, build_feature_dataframe
 from prediction_bot.model.model_store import DEFAULT_STORE_DIR
 from prediction_bot.model.predictor import Predictor
+from prediction_bot.model.regime import (
+    attach_regime_features,
+    compute_market_returns,
+    fit_regime_hmm,
+    predict_regimes,
+    regime_feature_columns,
+)
 from prediction_bot.model.splitter import SplitResult, temporal_split
 from prediction_bot.model.trainer import build_labels, train
 
@@ -71,16 +78,51 @@ def _build_split_features(args: argparse.Namespace) -> tuple[list[str], pd.DataF
     return symbols, features, split
 
 
+def _attach_regime_to_split(split_mi: SplitResult, hmm, n_states: int) -> tuple[SplitResult, list[str]]:
+    """Attach lagged regime one-hot columns to each partition of a MultiIndex split."""
+    regime_cols = regime_feature_columns(n_states)
+
+    def _attach(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df.assign(**{c: 0.0 for c in regime_cols})
+        market_returns = compute_market_returns(df)
+        states = predict_regimes(hmm, market_returns)
+        return attach_regime_features(df, states, n_states)
+
+    return (
+        SplitResult(
+            train=_attach(split_mi.train),
+            val=_attach(split_mi.val),
+            test=_attach(split_mi.test),
+            train_end_date=split_mi.train_end_date,
+            val_end_date=split_mi.val_end_date,
+        ),
+        regime_cols,
+    )
+
+
 def cmd_train(args: argparse.Namespace) -> int:
     symbols, _, split = _build_split_features(args)
     split_mi = _to_multiindex_split(split)
     artifact_path = args.artifact_path or _default_artifact_path(args.model_version)
+
+    regime_hmm = None
+    feature_names = list(FEATURE_COLS)
+    if args.regime_states > 0:
+        train_market_returns = compute_market_returns(split_mi.train)
+        regime_hmm = fit_regime_hmm(train_market_returns, n_states=args.regime_states)
+        split_mi, regime_cols = _attach_regime_to_split(split_mi, regime_hmm, args.regime_states)
+        feature_names = list(FEATURE_COLS) + regime_cols
+
     train(
         split_mi,
         horizon_days=args.horizon_days,
         model_version=args.model_version,
         symbol_universe=symbols,
         artifact_path=artifact_path,
+        feature_names=feature_names,
+        regime_hmm=regime_hmm,
+        regime_n_states=args.regime_states,
     )
     payload = {
         "artifact_path": str(artifact_path),
@@ -108,12 +150,40 @@ def cmd_predict(args: argparse.Namespace) -> int:
     if features.empty:
         raise ValueError("No features available for prediction")
 
-    latest = features[features["symbol"] == symbol].sort_values("date").iloc[-1]
-    feature_row = {col: float(latest[col]) for col in FEATURE_COLS}
     predictor = Predictor(args.artifact_path)
+    if predictor.regime_n_states > 0 and predictor.regime_hmm is not None:
+        features_mi = features.set_index(["symbol", "date"])
+        market_returns = compute_market_returns(features_mi)
+        states = predict_regimes(predictor.regime_hmm, market_returns)
+        features = attach_regime_features(features_mi, states, predictor.regime_n_states).reset_index()
+        if features.empty:
+            raise ValueError("No features available for prediction after regime attachment")
+
+    latest = features[features["symbol"] == symbol].sort_values("date").iloc[-1]
+    feature_row = {col: float(latest[col]) for col in predictor.feature_cols}
     result = predictor.predict(symbol, feature_row, args.prediction_date)
     _write_json_output(result.model_dump(mode="json"), args.output_path)
     return 0
+
+
+def _score_partition(partition: pd.DataFrame, predictor: Predictor, horizon_days: int) -> tuple[list, list[int], pd.DataFrame]:
+    if predictor.regime_n_states > 0 and predictor.regime_hmm is not None:
+        market_returns = compute_market_returns(partition)
+        states = predict_regimes(predictor.regime_hmm, market_returns)
+        partition = attach_regime_features(partition, states, predictor.regime_n_states)
+
+    labels = build_labels(partition, horizon_days=horizon_days)
+    valid_mask = labels.notna()
+    scored = partition.loc[valid_mask]
+    if scored.empty:
+        raise ValueError("No scorable rows found in selected partition")
+
+    feature_rows = scored[list(predictor.feature_cols)].to_dict(orient="records")
+    pred_dates = [pd.Timestamp(d).date() for d in scored.index.get_level_values("date")]
+    pred_symbols = list(scored.index.get_level_values("symbol"))
+    results = predictor.predict_many(pred_symbols, feature_rows, pred_dates)
+    actuals = labels.loc[valid_mask].astype(int).tolist()
+    return results, actuals, scored
 
 
 def cmd_evaluate(args: argparse.Namespace) -> int:
@@ -121,18 +191,8 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     split_mi = _to_multiindex_split(split)
     predictor = Predictor(args.artifact_path)
     partition = {"train": split_mi.train, "val": split_mi.val, "test": split_mi.test}[args.partition]
-    labels = build_labels(partition, horizon_days=args.horizon_days)
-    valid_mask = labels.notna()
-    scored = partition.loc[valid_mask]
-    if scored.empty:
-        raise ValueError(f"No scorable rows found in {args.partition} partition")
-
-    feature_rows = scored[FEATURE_COLS].to_dict(orient="records")
-    pred_dates = [pd.Timestamp(d).date() for d in scored.index.get_level_values("date")]
-    pred_symbols = list(scored.index.get_level_values("symbol"))
-    results = predictor.predict_many(pred_symbols, feature_rows, pred_dates)
-    paired = list(zip(results, labels.loc[valid_mask].astype(int).tolist()))
-    metrics = evaluate(paired, calibration_bins=args.calibration_bins)
+    results, actuals, _ = _score_partition(partition, predictor, args.horizon_days)
+    metrics = evaluate(list(zip(results, actuals)), calibration_bins=args.calibration_bins)
 
     payload = {
         "partition": args.partition,
@@ -157,6 +217,73 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_backtest(args: argparse.Namespace) -> int:
+    symbols, _, split = _build_split_features(args)
+    split_mi = _to_multiindex_split(split)
+    predictor = Predictor(args.artifact_path)
+    partition = {"train": split_mi.train, "val": split_mi.val, "test": split_mi.test}[args.partition]
+    results, actuals, scored = _score_partition(partition, predictor, args.horizon_days)
+
+    prediction_rows = []
+    strategy_returns: list[float] = []
+    equity = 1.0
+    equity_curve: list[float] = []
+
+    closes = scored["close"].to_numpy(dtype=float)
+    future_closes = closes.copy()
+    if isinstance(scored.index, pd.MultiIndex) and "symbol" in scored.index.names:
+        future_close_series = scored["close"].groupby(level="symbol", sort=False).shift(-args.horizon_days)
+        future_closes = future_close_series.to_numpy(dtype=float)
+
+    for result, actual, (_, row), future_close in zip(results, actuals, scored.iterrows(), future_closes):
+        p_up = result.p_up
+        signal = 1 if p_up >= args.threshold else 0
+        raw_return = 0.0 if pd.isna(future_close) else float(future_close / float(row["close"]) - 1.0)
+        strategy_return = signal * raw_return
+        strategy_returns.append(strategy_return)
+        equity *= (1.0 + strategy_return)
+        equity_curve.append(equity)
+        prediction_rows.append({
+            "symbol": result.symbol,
+            "prediction_date": result.prediction_date.isoformat(),
+            "p_up": p_up,
+            "confidence": result.confidence,
+            "actual": actual,
+            "signal": signal,
+            "close": float(row["close"]),
+            "future_close": None if pd.isna(future_close) else float(future_close),
+            "raw_return": raw_return,
+            "strategy_return": strategy_return,
+            "equity": equity,
+        })
+
+    pred_path = args.predictions_output_path
+    pred_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(prediction_rows).to_csv(pred_path, index=False)
+
+    equity_series = pd.Series(equity_curve, dtype=float)
+    running_max = equity_series.cummax()
+    drawdown = ((equity_series / running_max) - 1.0).min() if not equity_series.empty else 0.0
+    trades = sum(row["signal"] for row in prediction_rows)
+    wins = sum(1 for row in prediction_rows if row["signal"] == 1 and row["strategy_return"] > 0)
+    hit_rate = float(wins / trades) if trades else 0.0
+    summary = {
+        "partition": args.partition,
+        "symbols": symbols,
+        "strategy": "long_only_threshold",
+        "threshold": args.threshold,
+        "n_predictions": len(prediction_rows),
+        "n_trades": trades,
+        "hit_rate": hit_rate,
+        "cumulative_return": float(equity - 1.0),
+        "max_drawdown": float(drawdown),
+        "predictions_output_path": str(pred_path),
+    }
+    summary_path = args.output_path or pred_path.with_name("backtest_summary.json")
+    _write_json_output(summary, summary_path)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="prediction-bot", description="Train and run the prediction bot")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -174,6 +301,12 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--val-frac", type=float, default=0.15)
     train_parser.add_argument("--artifact-path", type=Path, default=None)
     train_parser.add_argument("--output-path", type=Path, default=None)
+    train_parser.add_argument(
+        "--regime-states",
+        type=int,
+        default=0,
+        help="Number of HMM regime states to fit on the train window and add as one-hot features. 0 disables.",
+    )
     train_parser.add_argument("--stock-symbols", nargs="*", default=default_stock_symbols)
     train_parser.add_argument("--crypto-symbols", nargs="*", default=default_crypto_symbols)
     train_parser.set_defaults(func=cmd_train)
@@ -202,6 +335,22 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument("--stock-symbols", nargs="*", default=default_stock_symbols)
     eval_parser.add_argument("--crypto-symbols", nargs="*", default=default_crypto_symbols)
     eval_parser.set_defaults(func=cmd_evaluate)
+
+    backtest_parser = subparsers.add_parser("backtest", help="Run a simple long-only threshold backtest")
+    backtest_parser.add_argument("--symbols", required=True, help="Comma-separated symbols to backtest")
+    backtest_parser.add_argument("--start-date", type=_parse_date, required=True, help="Start date (YYYY-MM-DD)")
+    backtest_parser.add_argument("--end-date", type=_parse_date, required=True, help="End date (YYYY-MM-DD)")
+    backtest_parser.add_argument("--artifact-path", type=Path, required=True)
+    backtest_parser.add_argument("--partition", choices=["train", "val", "test"], default="test")
+    backtest_parser.add_argument("--horizon-days", type=int, default=5)
+    backtest_parser.add_argument("--train-frac", type=float, default=0.70)
+    backtest_parser.add_argument("--val-frac", type=float, default=0.15)
+    backtest_parser.add_argument("--threshold", type=float, default=0.55)
+    backtest_parser.add_argument("--output-path", type=Path, default=None)
+    backtest_parser.add_argument("--predictions-output-path", type=Path, required=True)
+    backtest_parser.add_argument("--stock-symbols", nargs="*", default=default_stock_symbols)
+    backtest_parser.add_argument("--crypto-symbols", nargs="*", default=default_crypto_symbols)
+    backtest_parser.set_defaults(func=cmd_backtest)
 
     return parser
 
