@@ -9,3 +9,5 @@ __pycache__/
 htmlcov/
 dist/
 build/
+.DS_Store
+**/.DS_Store
