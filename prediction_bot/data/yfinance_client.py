@@ -16,6 +16,7 @@ class YFinanceClient:
             end=end.isoformat(),
             auto_adjust=True,
             progress=False,
+            multi_level_index=False,
         )
         if df.empty:
             logger.warning("yfinance returned empty data for %s", symbol)
